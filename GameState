@@ -1,0 +1,782 @@
+using Photon.Pun;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+public class GameState : MonoBehaviour
+{
+    public Material[] CowSkins;
+    public GameObject[] SoldierCowPrefabs;
+    public GameObject[] HWCowPrefabs;
+    public static GameState instance = null;
+    private GameEvents E_GameEvents;
+    public GridSquare[,] a_Map { get; private set; }
+    public List<List<Unit>> l_UnitLists;
+    public List<Unit> l_Player1Units;
+    public List<Unit> l_Player2Units;
+    public List<CowSpawnLocation> l_Player1CowSpawnLocations;
+    public List<CowSpawnLocation> l_Player2CowSpawnLocations;
+    private List<CowStub> l_Player1CowStubs;
+    private List<CowStub> l_Player2CowStubs;
+    public List<AlienSpawnLocation> l_AlienSpawnLocations;
+    public HashSet<Cover> l_AllCover { get; private set; }
+    public Unit u_CurrentUnit { get; private set; }
+    public Unit u_LastUnit { get; private set; }
+    public int i_MapX;
+    public int i_MapZ;
+    public int i_TurnNumber;
+    public HashSet<GridSquare> hs_InPlayer1LOS;
+    public HashSet<GridSquare> hs_InPlayer2LOS;
+    public List<GridSquare> l_2los;
+    public bool b_GameStarted;
+    public bool b_MyTurn;
+    public bool b_CowsSpawned = false;
+    public bool b_IsPlayer1;
+
+
+    private void Awake()
+    {
+        if(sGameManager.instance != null)
+        {
+            l_Player1CowStubs = new List<CowStub>(sGameManager.instance.CowData);
+        }
+        E_GameEvents = GameObject.FindGameObjectWithTag("EventManager").GetComponent<GameEvents>();
+        if (instance == null)
+        {
+            instance = this;
+        }
+        else if (instance != this)
+        {
+            Destroy(gameObject);
+        }
+        l_Player1Units = new List<Unit>();
+        l_Player2Units = new List<Unit>();
+        l_UnitLists = new List<List<Unit>>
+        {
+            l_Player1Units,
+            l_Player2Units
+        };
+    }
+
+    private void OnEnable()
+    {
+        GameEvents.e_Player2StartTurn += IncrementTurn;
+        GameEvents.e_Player1StartTurn += IncrementTurn;
+        GameEvents.e_Player1UnitSpawned += Player1UnitSpawned;
+        GameEvents.e_Player2UnitSpawned += Player2UnitSpawned;
+        GameEvents.e_UnitDied += UnitDied;
+        GameEvents.e_GameStart += GameStart;
+        GameEvents.e_UnitFreed += UnitFreed;
+    }
+
+    private void OnDisable()
+    {
+        GameEvents.e_Player2StartTurn -= IncrementTurn;
+        GameEvents.e_Player1StartTurn -= IncrementTurn;
+        GameEvents.e_Player1UnitSpawned -= Player1UnitSpawned;
+        GameEvents.e_Player2UnitSpawned -= Player2UnitSpawned;
+        GameEvents.e_UnitDied -= UnitDied;
+        GameEvents.e_GameStart -= GameStart;
+        GameEvents.e_UnitFreed -= UnitFreed;
+    }
+
+    private void Start()
+    {
+        b_GameStarted = false;
+        a_Map = new GridSquare[i_MapX + 2, i_MapZ + 2];
+        FindGridSquares();
+        SetupCover();
+        SetupCoverage();
+        i_TurnNumber = 0;
+        if (!PhotonNetwork.InRoom)
+        {
+            StartCoroutine(DelayedStart());
+        }
+        else
+        {
+            StartCoroutine(WaitForPlayers());
+        }
+    }
+
+    public IEnumerator WaitForPlayers()
+    {
+        while (!sGameManager.instance.b_BothPlayersInGame)
+        {
+            yield return null;
+        }
+        yield return new WaitForSeconds(1f);
+        if(GameObject.FindGameObjectWithTag("Player1") != null)
+        {
+            var player1 = GameObject.FindGameObjectWithTag("Player1").GetComponent<MultiPlayerPlayerController>();
+            b_IsPlayer1 = player1.myPV.IsMine;
+        }
+        else
+        {
+            b_IsPlayer1 = true;
+        }
+        InitGameMulti();
+    }
+
+    public IEnumerator DelayedStart()
+    {
+        yield return new WaitForSeconds(1.0f);
+        b_IsPlayer1 = true;
+        InitGame();
+    }
+
+    public void InitGame()
+    {
+        if (!b_GameStarted)
+        {
+            SetupUnits();
+            SpawnUnits();
+            SetupCoverage();
+            i_TurnNumber = 0;
+            E_GameEvents.OnPlayer1TurnStart();
+        }
+    }
+
+    public void InitGameMulti()
+    {
+        if(!b_GameStarted)
+        {
+            SetupUnits();
+            SpawnUnits();
+            SetupCoverage();
+            i_TurnNumber = 0;
+            StartCoroutine(TurnFlicker());
+        }
+    }
+
+    public IEnumerator TurnFlicker()
+    {
+        if(b_IsPlayer1)
+        {
+            yield return new WaitForSeconds(2f);
+            E_GameEvents.OnPlayer1TurnStart();
+            yield return new WaitForSeconds(.5f);
+            E_GameEvents.OnTurnComplete();
+            yield return new WaitForSeconds(1f);
+            E_GameEvents.OnStartGame();
+        }
+    }
+
+    public void GameStart()
+    {
+        if (b_IsPlayer1)
+        {
+            E_GameEvents.OnPlayer1TurnStart();           
+        }
+        else
+        {
+            b_MyTurn = false;
+            u_CurrentUnit.UnitDeselected();
+        }
+        b_GameStarted = true;
+        i_TurnNumber = 0;
+    }
+
+    private void SetupCover()
+    {
+        FindCover();
+        PlaceCover();
+    }
+
+    public void SetupCoverage()
+    {
+        foreach (GridSquare gs in a_Map)
+        {
+            if (gs != null)
+            {
+                gs.CheckForCoverage();
+            }
+        }
+    }
+
+    public void FindCover()
+    {
+        l_AllCover = new HashSet<Cover>();
+        List<GameObject> allCover = new List<GameObject>(GameObject.FindGameObjectsWithTag("Cover"));
+        allCover.AddRange(GameObject.FindGameObjectsWithTag("Targetable_Cover"));
+        foreach (GameObject obj in allCover)
+        {
+            Cover cover = obj.GetComponent<Cover>();
+            if (cover != null)
+            {
+                l_AllCover.Add(cover);
+            }
+            else
+            {
+                TargetableCover tCover = obj.GetComponent<TargetableCover>();
+                if (tCover != null)
+                {
+                    l_AllCover.Add(tCover);
+                }
+                else
+                {
+                    throw new MissingComponentException();
+                }
+            }
+        }
+    }
+
+    public void PlaceCover()
+    {
+        foreach (Cover cover in l_AllCover)
+        {
+            cover.PlaceSelf();
+        }
+    }
+
+    public void SetupUnits()
+    {
+        if(l_Player1CowStubs != null && l_Player1CowStubs.Count == l_Player1CowSpawnLocations.Count)
+        {
+            for (int i = 0; i < l_Player1CowStubs.Count; i++)
+            {
+                l_Player1CowSpawnLocations[i].Cow_Stub = l_Player1CowStubs[i];
+                if (l_Player1CowSpawnLocations[i].SpawnPoint == null)
+                {
+                    throw new System.ArgumentNullException("SpawnPoint Null");
+                }
+            }
+        }
+        if (l_Player2CowStubs != null && l_Player2CowStubs.Count == l_Player2CowSpawnLocations.Count)
+        {
+            for (int i = 0; i < l_Player2CowStubs.Count; i++)
+            {
+                l_Player2CowSpawnLocations[i].Cow_Stub = l_Player2CowStubs[i];
+                if (l_Player2CowSpawnLocations[i].SpawnPoint == null)
+                {
+                    throw new System.ArgumentNullException("SpawnPoint Null");
+                }
+            }
+        }
+        foreach (AlienSpawnLocation alien in l_AlienSpawnLocations)
+        {
+            if(alien.SpawnPoint == null)
+            {
+                throw new System.ArgumentNullException("SpawnPoint Null");
+            }
+        }
+    }
+
+    public void SendInCows(int playerNum, CowSpawnLocation[] spawnLocsIn)
+    {
+        for (int i=0; i < spawnLocsIn.Length; i++)
+        {
+            if (playerNum == 1)
+            {
+                l_Player1CowSpawnLocations[i] = spawnLocsIn[i];
+            }
+            else
+            {
+                l_Player2CowSpawnLocations[i] = spawnLocsIn[i];
+            }
+        }
+    }
+        
+    public void SpawnUnits()
+    {
+        if (b_IsPlayer1)
+        {
+            SpawnPlayer1();
+        }
+        else
+        {
+            SpawnPlayer2();
+        }
+        foreach (AlienSpawnLocation alien in l_AlienSpawnLocations)
+        {
+            Vector3 spawnPoint = alien.SpawnPoint.transform.position;
+            GameObject spawnedAlien = Instantiate(alien.Alien, spawnPoint, Quaternion.identity);
+            sAIUnit AlienScript = spawnedAlien.GetComponent<sAIUnit>();
+            AlienScript.i_Id = alien.i_Id;
+            AlienScript.PlaceSelf(alien.SpawnPoint.GetComponentInChildren<GridSquare>());
+        }
+    }
+
+    private void SpawnPlayer2()
+    {
+        foreach (CowSpawnLocation cow in l_Player2CowSpawnLocations)
+        {
+            Quaternion playerRot = new Quaternion(0, 180, 0, 0);
+            if (PhotonNetwork.InRoom)
+            {
+                SpawnPlayer2MultiplayerCows(cow);
+                Debug.Log("SpawnPlayer2");
+            }
+            else
+            {
+                Debug.Log("YouNeverShouldHaveComeHere");
+            }
+
+        }
+        b_CowsSpawned = true;
+    }
+
+    private void SpawnPlayer2MultiplayerCows(CowSpawnLocation cow)
+    {
+        switch (cow.Cow_Stub.CowClass)
+        {
+            case 0:
+                MultiSpawnPlayer2Soldier(cow);
+                break;
+            case 1:
+                break;
+            case 2:
+                break;
+            case 3:
+                break;
+            case 4:
+                MultiSpawnPlayer2HWCow(cow);
+                break;
+            case 5:
+                break;
+            default:
+                break;
+        }
+
+    }
+
+    private void MultiSpawnPlayer2HWCow(CowSpawnLocation cow)
+    {
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        Quaternion playerRot = new Quaternion(0, 180, 0, 0);
+        GameObject spawnedCow;
+        Unit unitScript;
+        int x;
+        int z;
+        switch (cow.Cow_Stub.CowSkin)
+        {
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowBase", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowHorned", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowLongHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowMediumHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowShortHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript = spawnedCow.GetComponent<Unit>();
+        unitScript.b_IsPlayer1sUnit = false;
+        x = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_X;
+        z = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_Z;
+        unitScript.MultiUnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, x, z, "Player2Unit");
+    }
+
+    private void MultiSpawnPlayer2Soldier(CowSpawnLocation cow)
+    {
+        Quaternion playerRot = new Quaternion(0, 180, 0, 0);
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        GameObject spawnedCow;
+        Unit unitScript;
+        int x;
+        int z;
+        switch (cow.Cow_Stub.CowSkin)
+        {
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowBase", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowHorned", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowLonghorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowMediumHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowShortHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript.b_IsPlayer1sUnit = false;
+        x = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_X;
+        z = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_Z;
+        unitScript.MultiUnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, x, z, "Player2Unit");
+    }
+
+    private void SpawnPlayer1()
+    {
+        foreach (CowSpawnLocation cow in l_Player1CowSpawnLocations)
+        {
+            if (PhotonNetwork.InRoom)
+            {
+                SpawnPlayer1MultiplayerCow(cow);
+            }
+            else
+            {
+                SpawnSinglePlayerCows(cow);
+            }
+        }
+        b_CowsSpawned = true;
+    }
+
+    private void SpawnSinglePlayerCows(CowSpawnLocation cow)
+    {
+        switch (cow.Cow_Stub.CowClass)
+        {
+            case 0:
+                SpawnSiglePlayerSoldier(cow);
+                break;
+            case 1:
+                break;
+            case 2:
+                break;
+            case 3:
+                break;
+            case 4:
+                SpawnSinglePlayerHWCow(cow);
+                break;
+            case 5:
+                break;
+            default:
+                Debug.Log("YouNeverShouldHaveComeHere");
+                break;
+        }
+    }
+
+    private void SpawnSinglePlayerHWCow(CowSpawnLocation cow)
+    {
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        Quaternion playerRot = new Quaternion(0, 0, 0, 0);
+        GameObject spawnedCow;
+        Unit unitScript;
+        switch (cow.Cow_Stub.CowSkin)
+        {
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = Instantiate(HWCowPrefabs[0], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = Instantiate(HWCowPrefabs[1], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = Instantiate(HWCowPrefabs[2], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = Instantiate(HWCowPrefabs[3], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = Instantiate(HWCowPrefabs[4], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript.b_IsPlayer1sUnit = true;
+        unitScript.b_IsActive = cow.b_IsActive;
+        unitScript.UnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, cow.SpawnPoint.GetComponent<GridSquare>(), "Player1Unit");
+    }
+
+    private void SpawnSiglePlayerSoldier(CowSpawnLocation cow)
+    {
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        Quaternion playerRot = new Quaternion(0, 0, 0, 0);
+        GameObject spawnedCow;
+        Unit unitScript;
+        switch (cow.Cow_Stub.CowSkin)
+        {
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = Instantiate(SoldierCowPrefabs[0], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = Instantiate(SoldierCowPrefabs[1], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = Instantiate(SoldierCowPrefabs[2], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = Instantiate(SoldierCowPrefabs[3], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = Instantiate(SoldierCowPrefabs[4], spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript.b_IsPlayer1sUnit = true;
+        unitScript.b_IsActive = cow.b_IsActive;
+        unitScript.UnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, cow.SpawnPoint.GetComponent<GridSquare>(), "Player1Unit");
+    }
+
+    private void SpawnPlayer1MultiplayerCow(CowSpawnLocation cow)
+    {
+        switch (cow.Cow_Stub.CowClass)
+        {
+            case 0:
+                MultiSpawnPlayer1Soldier(cow);
+                break;
+            case 1:
+                break;
+            case 2:
+                break;
+            case 3:
+                break;
+            case 4:
+                MultiSpawnPlayer1HWCow(cow);
+                break;
+            case 5:
+                break;
+            default:
+                break;
+        }
+    }
+
+    private void MultiSpawnPlayer1Soldier(CowSpawnLocation cow)
+    {
+        int x;
+        int z;
+        GameObject spawnedCow;
+        Unit unitScript;
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        Quaternion playerRot = new Quaternion(0, 0, 0, 0);
+        switch (cow.Cow_Stub.CowSkin)
+        {
+
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowBase", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowHorned", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowLonghorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowMediumHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = PhotonNetwork.Instantiate("SoldierCowShortHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript.b_IsPlayer1sUnit = true;
+        x = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_X;
+        z = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_Z;
+        unitScript.MultiUnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, x, z, "Player1Unit");
+    }
+
+    private void MultiSpawnPlayer1HWCow(CowSpawnLocation cow)
+    {
+        Vector3 spawnPoint = cow.SpawnPoint.transform.position;
+        Quaternion playerRot = new Quaternion(0, 0, 0, 0);
+        GameObject spawnedCow;
+        Unit unitScript;
+        int x;
+        int z;
+        switch (cow.Cow_Stub.CowSkin)
+        {
+            case 0:
+            case 1:
+            case 2:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowBase", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 3:
+            case 4:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowHorned", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 5:
+            case 6:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowLongHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 7:
+            case 8:
+            case 9:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowMediumHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+            case 10:
+            case 11:
+            default:
+                spawnedCow = PhotonNetwork.Instantiate("HWCowShortHorn", spawnPoint, playerRot);
+                unitScript = spawnedCow.GetComponent<Unit>();
+                break;
+        }
+        unitScript = spawnedCow.GetComponent<Unit>();
+        unitScript.b_IsPlayer1sUnit = true;
+        x = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_X;
+        z = cow.SpawnPoint.GetComponentInChildren<GridSquare>().i_Z;
+        unitScript.MultiUnitSpawned(cow.Cow_Stub.CowName, cow.Cow_Stub.CowSkin, x, z, "Player1Unit");
+    }
+
+    public void IncrementTurn()
+    {
+        i_TurnNumber++;
+    }
+
+    public void RemoveUnitFromLists(Unit unit)
+    {
+        foreach (List<Unit> list in l_UnitLists)
+        {
+            list.Remove(unit);
+        }
+    }
+
+    public void FindGridSquares()
+    {
+        var list = GameObject.FindGameObjectsWithTag("GridCube");
+        foreach (GameObject cube in list)
+        {
+            var gs = cube.GetComponent<GridSquare>();
+            a_Map[gs.i_X, gs.i_Z] = gs;
+        }
+    }
+
+    public void SelectUnit(Unit _unit)
+    {
+        if (b_MyTurn)
+        {
+            if (_unit != u_CurrentUnit)
+            {
+                u_LastUnit = u_CurrentUnit;
+                if (u_LastUnit != null)
+                {
+                    u_LastUnit.UnitDeselected();
+                }
+                u_CurrentUnit = _unit;
+            }
+            else
+            {
+            }
+            u_CurrentUnit.UnitSelected();
+            E_GameEvents.OnPlayer1UnitSelected();
+        }
+    }
+
+    public void UnitDied(Unit _unit)
+    {
+        if (!l_Player2Units.Remove(_unit))
+        {
+            l_Player1Units.Remove(_unit);
+            if(l_Player1Units.Count == 0)
+            {
+                E_GameEvents.OnPlayer1Lost();
+            }
+        }
+        else
+        {
+            if(l_Player2Units.Count == 0)
+            {
+                E_GameEvents.OnPlayer2Lost();
+            }
+        }
+    }
+
+    public void Player1UnitSpawned(Unit _unit)
+    {
+        if(_unit != null)
+        {
+            l_Player1Units.Add(_unit);
+        }
+    }
+
+    public void Player2UnitSpawned(Unit _unit)
+    {
+        if (_unit != null)
+        {
+            l_Player2Units.Add(_unit);
+        }
+    }
+
+    public void UnitFreed(Unit _unit)
+    {
+        CheckPlayer1LOS();
+    }
+
+    public void CheckPlayer1LOS()
+    {
+        hs_InPlayer1LOS = new HashSet<GridSquare>();
+        foreach (Unit unit in l_Player1Units)
+        {
+            if(unit.b_IsActive)
+            {
+                hs_InPlayer1LOS.UnionWith(unit.CheckLOS());
+            }
+        }
+    }
+
+    public void CheckPlayer2LOS()
+    {
+        hs_InPlayer2LOS = new HashSet<GridSquare>();
+        foreach(Unit unit in l_Player2Units)
+        {
+            if(unit.b_IsActive)
+            {
+                hs_InPlayer2LOS.UnionWith(unit.CheckLOS());
+            }
+        }
+        l_2los = new List<GridSquare>(hs_InPlayer2LOS);
+    }
+}
+
+
